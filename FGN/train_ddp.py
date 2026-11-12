@@ -352,4 +352,4 @@ def main():
 main()
 
 
-#!torchrun --nproc_per_node=2 main.py
+#!torchrun --nproc_per_node=2 train_ddp.py
