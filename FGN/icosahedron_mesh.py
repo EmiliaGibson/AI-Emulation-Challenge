@@ -318,7 +318,9 @@ def create_grid_to_mesh_edges(mesh_graph, site_idx,refinement):
     mesh_vertices = mesh_graph['mesh_nodes'].pos.numpy()
     #convert training sites to lat-lon
     grid_lat, grid_lon = site_index_to_lat_lon(site_idx)
-
+    grid_lat = grid_lat/180*np.pi
+    grid_lon = grid_lon/180*np.pi
+    
     # Grid points -> Cartesian coordinates on unit sphere
     grid_xyz = np.column_stack([
         np.cos(grid_lat) * np.cos(grid_lon),
