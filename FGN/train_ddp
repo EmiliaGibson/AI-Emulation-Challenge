@@ -1,0 +1,355 @@
+import numpy as np
+import os
+import datetime
+from pathlib import Path 
+import torch
+import torch.nn as nn
+from fgn_transformer import FGN
+from crps_adapted import ContinuousRankedProbabilityScore
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import DataLoader
+from transformers import get_cosine_schedule_with_warmup
+
+
+AGES = [1, 10, 20, 30, 50, 70, 100, 150, 200, 250, 300, 350, 400, 450, 500]
+
+INPUT_DIR = Path('/kaggle/input/')
+COMPDATA_DIR = Path('/kaggle/input/datasets/emiliagibson/compsitesdata')
+
+# full_graph = torch.load('/kaggle/input/models/emiliagibson/fgn-graph/pytorch/default/1/mesh_graph.pt',weights_only=False)
+full_graph_large = torch.load('/kaggle/input/models/emiliagibson/fgn-graph/pytorch/refinement_4/1/mesh_graph_large.pt', weights_only=False)
+
+def print_rank0(*args, **kwargs):
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        print(*args, **kwargs)
+
+print_rank0('start loading data')
+Features = np.load(COMPDATA_DIR / 'comp_features_normalised-2.npy')
+Y_train_n = np.load(COMPDATA_DIR / 'comp_targets_normalised-2.npy')
+print_rank0("targets shape = ", Y_train_n.shape)
+print_rank0('data loaded')
+Features = torch.tensor(Features,dtype=torch.float32)  #(S,40,136)
+Y_train_n = torch.tensor(Y_train_n,dtype=torch.float32) # (A,S,41,7)
+
+
+val_targets_7_n = np.load('/kaggle/input/datasets/emiliagibson/validationdata/val_targets_7_normalised.npy')
+val_targets_7_n = torch.tensor(val_targets_7_n, dtype = torch.float32)
+
+test_input = torch.cat((Y_train_n[0,:,:2],Features[:,:2],torch.full((6171, 2,1), AGES[0]/ 500.0, dtype=torch.float32)),
+         axis=2)
+test_input = test_input.permute(1,0,2)
+print(test_input.shape)
+
+#### DEFINE DATALOADERS 
+class TrainingDataset(torch.utils.data.Dataset):
+    """Custom dataset for AR rollouts of up to 5 steps."""
+
+    def __init__(self, inputs, targets):
+        """
+        Arguments:
+            features (tensor): 
+            targets (tensor): 
+            
+        """
+        self.inputs = inputs # (S,40,136)
+        self.targets = targets  # (A,S,41,7)
+        self.ages = [1, 10, 20, 30, 50, 70, 100, 150, 200, 250, 300, 350, 400, 450, 500]
+        self.years = 40
+    def __len__(self):
+        return len(self.targets)*self.years
+
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+        age = idx%len(self.ages)
+        year = idx%self.years
+        
+        input_= torch.full((len(self.inputs), 5, 136),torch.nan)
+        input_[:,:39-year+1] = self.inputs[:,year:year+5]
+        target_ = torch.full((len(input_), 6, 7),torch.nan)
+        target_[:,:40-year+1] = self.targets[age, :, year:year+6]
+        
+        age_col_ = torch.full((len(self.inputs), 5,1), self.ages[age] / 500.0, dtype=torch.float32)
+        input_ = torch.cat([input_,age_col_],axis=2)
+        sample = input_,target_
+        return sample
+
+class ValidationDataset(torch.utils.data.Dataset):
+    """Custom dataset."""
+
+    def __init__(self, x_feats, x_init, val_inputs):
+        """
+        Arguments:
+            features (tensor): 
+            targets (tensor): 
+            
+        """
+        self.x_feats = x_feats # (S,40,136)
+        self.x_init = x_init
+        self.val_inputs = val_inputs # (A,338,41,7)
+        self.ages = [1, 10, 20, 30, 50, 70, 100, 150, 200, 250, 300, 350, 400, 450, 500]
+        self.years = 40
+
+    def __len__(self):
+        return len(self.val_inputs)*self.years
+
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+        age = idx%len(self.ages)
+        year = idx%self.years
+        
+        input_= torch.full((len(self.x_feats), 5, 136),torch.nan)
+        input_[:,:39-year+1] = self.x_feats[:,year:year+5]
+        
+        val_target_ = torch.full((self.val_inputs.shape[1], 6, 7),torch.nan) #338,6,7
+        val_target_[:,:40-year+1] = self.val_inputs[age, :, year:year+6]
+
+        x_init7 = torch.full((len(input_), 6, 7),torch.nan)
+        x_init7[:,:40-year+1] = self.x_init[age, :, year:year+6]
+    
+        age_col_ = torch.full((len(input_), 5,1), self.ages[age] / 500.0, dtype=torch.float32)
+        input_ = torch.cat([input_,age_col_],axis=2)
+        sample = input_, x_init7, val_target_
+
+        return sample
+
+
+def get_ddp_dataloader(dataset, batch_size, local_rank):
+    # 1. Create the DistributedSampler
+    sampler = DistributedSampler(
+        dataset,
+        num_replicas=dist.get_world_size(), # Total GPUs
+        rank=local_rank,                     # GPU ID for current process
+        shuffle=True                         # Shuffles data evenly across processes
+    )
+
+    # 2. Pass sampler to DataLoader (MUST set shuffle=False in DataLoader)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,               # Per-GPU batch size
+        sampler=sampler,
+        num_workers=4,
+        pin_memory=True,
+    )
+    
+    return dataloader, sampler
+
+def train_one_epoch(epoch_index, model,loss_fn,  AR_STEPS, dataloader, sampler, optimizer, scheduler, phys_vars_threshold, local_rank):
+    running_loss = 0.
+    running_step_losses = torch.zeros(AR_STEPS).to(local_rank)
+    last_loss = 0
+    # CRITICAL: Ensures different random shuffling every epoch across GPUs
+    sampler.set_epoch(epoch_index)
+    
+    # Here, we use enumerate(training_loader) instead of
+    # iter(training_loader) so that we can track the batch
+    # index and do some intra-epoch reporting
+    for i, data in enumerate(dataloader):
+        # Every data instance is an input + label pair
+        batch_features, batch_targets = data
+
+        # Move data to GPU
+        batch_features = batch_features.to(local_rank) #(B, 6171,5,137)
+        batch_targets = batch_targets.to(local_rank) #(B,6171,6,7)
+        
+        # Zero your gradients for every batch!
+        optimizer.zero_grad()
+
+        total_loss = 0
+        step_losses = []
+        outputs =  batch_targets[:,:,0]
+        for j in range(AR_STEPS):
+        # Make predictions for this batch
+            #generate k different sample
+            mask = torch.isnan(batch_targets[:,:,j+1]).sum(axis=[1,2])==0
+            feats = torch.cat([outputs[mask], batch_features[mask,:,j]],axis=2)
+            feats = feats.to(local_rank)
+            sample_outputs = []
+            for k in range(2):
+                global_norm_vector = torch.rand(batch_features.shape[0],1,8)
+                deltas = model(feats, global_norm_vector)
+                # feats[:,:,j] = torch.cat([outputs[mask,:,j], batch_features[mask,:,j]],axis=2)
+                # Non-in-place update
+                updated_outputs = outputs.clone()
+                updated_outputs[mask] = outputs[mask] + deltas
+                outputs = torch.maximum(updated_outputs, phys_vars_threshold)
+                sample_outputs.append(outputs[mask])
+            # print('outputs shape = ', torch.stack(sample_outputs, axis=1).shape)
+            # print('targets shape = ', batch_targets[mask,:,j+1].shape)
+            sample_outputs = torch.stack(sample_outputs,axis=2)
+            # Compute the loss and its gradients
+            # step_loss = loss_fn(outputs[mask], batch_targets[mask,:,j+1])
+            for batch in range(len(mask)):
+                for dim in range(7):
+                    step_loss = loss_fn(sample_outputs[batch,...,dim], batch_targets[mask,:,j+1,dim][batch]).mean()
+                    step_losses.append(step_loss)
+            total_loss = total_loss + sum(step_losses)/(7*(batch+1))
+
+        total_loss = total_loss/AR_STEPS
+        total_loss.backward()
+        #gradient clipping
+        nn.utils.clip_grad_norm_(model.parameters(), 32, norm_type=2.0, error_if_nonfinite=False, foreach=None)
+        # Adjust learning weights
+        optimizer.step()
+        scheduler.step()
+        outputs.detach()
+
+        # Gather data and report
+        step_losses = torch.stack(step_losses)
+        running_loss += total_loss.item()
+        running_step_losses += total_loss.item()
+        # running_fraction += float(fraction_negative)
+        if i % 10 == 9:
+            
+            last_loss = running_loss / 10 # loss per batch
+            # last_fraction = running_fraction / 10
+            print_rank0(f'  batch {i + 1} loss: {last_loss}  AR step loss: {(running_step_losses/10).tolist()}' )# frac_negative: {last_fraction}')
+            running_loss = 0.
+            running_step_losses *= 0
+            # running_fraction = 0.
+
+    return last_loss
+
+
+def validate_model(init_feats, delta_output,index_comp_NN,distance_to_comp):
+    outputs_nns = delta_output[:,index_comp_NN]
+    weighted_sum = torch.einsum('ijkl,jk->ijl', outputs_nns, distance_to_comp)
+    return init_feats + weighted_sum/torch.sum(distance_to_comp,axis=1,keepdims=True)
+
+
+
+def main():
+    # 1. Initialize process group (e.g. using torchrun or multiprocessing)
+    dist.init_process_group(backend="nccl")
+    # dist.init_process_group(backend="gloo")
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    loss_fn = ContinuousRankedProbabilityScore(test_input.shape[1])
+    loss_fn = loss_fn.to(local_rank)
+    val_loss_fn =  ContinuousRankedProbabilityScore(val_targets_7_n.shape[1])
+    val_loss_fn = val_loss_fn.to(local_rank)
+    index_comp_NN = np.load('/kaggle/input/datasets/emiliagibson/validationdata/val_index_train_NN.npy')
+    distance_to_comp = np.load('/kaggle/input/datasets/emiliagibson/validationdata/val_distance_to_train.npy')
+
+    index_comp_NN = torch.tensor(index_comp_NN,dtype=torch.long)
+    distance_to_comp = torch.tensor(distance_to_comp,dtype=torch.float32)
+    index_comp_NN = index_comp_NN.to(local_rank)
+    distance_to_comp = distance_to_comp.to(local_rank)
+
+    #ensure denormalised outputs of physocal variables are non-negative
+    phys_vars_threshold = np.load('/kaggle/input/datasets/emiliagibson/compsitesdata/physical_vars_threshold.npy')
+    phys_vars_threshold[[4,5]] = -np.inf #variables 4 and 5 are not non-negative
+    phys_vars_threshold = torch.tensor(phys_vars_threshold, dtype = torch.float32)
+    phys_vars_threshold = phys_vars_threshold.to(local_rank)
+
+    #### LOAD MODEL WITH DUMMY INPUTS
+    print_rank0('LOADING MODEL WITH DUMMY INPUTS')
+    # model = FGN(full_graph, ffw_hidden = 128, hidden = 128, num_layers = 5)
+    model = FGN(full_graph_large, ffw_hidden = 64, hidden = 64, num_layers = 2)
+
+    test = model(test_input, torch.rand(2,1,8))
+    # model.load_state_dict(torch.load('/kaggle/working/model_20261029_110318_95', weights_only=True,map_location=torch.device('cpu')))
+    print_rank0('Model successfully initialised')
+    model = model.to(local_rank)
+    
+    # # 3. Wrap with DDP (NOT DataParallel)
+    model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+    model.module.update_dict_buffers()
+
+    training_set = TrainingDataset(Features, Y_train_n)
+    train_dataloader, train_datasampler = get_ddp_dataloader(training_set, 24, local_rank)
+    # validation_set = ValidationDataset(Features, Y_train_n)
+    validation_set = ValidationDataset(Features, Y_train_n, val_targets_7_n)
+    validation_dataloader = DataLoader(validation_set, batch_size=64, shuffle=False,
+                            pin_memory=True)
+    
+    torch.autograd.set_detect_anomaly(False)
+    peak_lr = 8e-4
+    optimizer  = torch.optim.Adam(model.parameters(), lr=peak_lr, weight_decay=0.1)
+    # print(len(train_dataloader))
+    NUM_EPOCHS = 200
+    scheduler = get_cosine_schedule_with_warmup(optimizer=optimizer,
+                                        num_warmup_steps=NUM_EPOCHS//2*len(train_dataloader), num_training_steps=NUM_EPOCHS*len(train_dataloader))
+
+    time_stamp =  datetime.datetime.now()
+
+    epoch_number = 0
+    
+    best_vloss = 0.2
+
+    AR_STEPS=1    
+    for epoch in range(NUM_EPOCHS):
+    #     if epoch == NUM_EPOCHS//2:
+    #         AR_STEPS=2
+    #         best_vloss = 0.05
+        
+        print_rank0(f'EPOCH {epoch_number + 1}:')
+        
+        # Make sure gradient tracking is on, and do a pass over the data
+        model.train(True)
+        avg_loss = train_one_epoch(epoch_number, model, loss_fn, AR_STEPS, train_dataloader, train_datasampler, optimizer,scheduler, phys_vars_threshold, local_rank)
+        
+
+        running_vloss = 0.0
+        avg_vloss = 0.0
+        model.eval()
+
+        # #one step val loss for now
+        # # Disable gradient computation and reduce memory consumption.
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            with torch.no_grad():
+                vloss=0
+                v_step_loss = []
+                for i, vdata in enumerate(validation_dataloader):
+                    x_feats, x_init7, vtargets = vdata
+                    #send batches to device
+                    x_feats = x_feats.to(local_rank)
+                    x_init7 =  x_init7.to(local_rank)
+                    xinputs = x_init7[:,:,0]
+                    vtargets = vtargets.to(local_rank)
+                    vinputs = vtargets[:,:,0]
+                    for j in range(AR_STEPS):
+                        mask = torch.isnan(vtargets[:,:,j+1]).sum(axis=[1,2])==0
+                        sample_outputs = []
+                        for k in range(2):
+                            global_norm = torch.rand(vtargets.shape[0],1,8)
+                            # delta = model(torch.cat([vinputs[mask],vfeats[mask]],axis=2), global_norm)
+                            delta = model(torch.cat([xinputs[mask], x_feats[mask,:,j]],axis=2), global_norm)
+                            xinputs[mask]+=delta
+                            vinputs[mask] = validate_model(vinputs[mask], delta, index_comp_NN, distance_to_comp)
+                            sample_outputs.append(vinputs[mask])
+                        sample_outputs = torch.stack(sample_outputs, dim=2)
+                        for batch in range(len(mask)):
+                            for dim in range(7):
+                                vloss = val_loss_fn(sample_outputs[batch,...,dim], vtargets[mask,:,j+1,dim][batch]).mean()
+                                v_step_loss.append(vloss)
+                        running_vloss = sum(v_step_loss)/(7*(batch+1))
+            
+            
+            print_rank0(f'AR val step loss { torch.tensor([v_step_loss[i::AR_STEPS] for i in range(AR_STEPS)]).mean() }')
+            avg_vloss = running_vloss / (AR_STEPS*(i + 1))
+            print_rank0(f'LOSS train {avg_loss} valid {avg_vloss} LR = {optimizer.param_groups[0]['lr']}')
+    
+            # Track best performance, and save the model's state
+            if avg_vloss < best_vloss:
+                best_vloss = avg_vloss
+                model_path = f'model_{time_stamp.strftime('%Y%m%d_%H%M%S')}_{epoch_number}'
+                torch.save(model.module.state_dict(), model_path)
+        
+        
+        epoch_number += 1
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        model_path = f'final_model_{time_stamp.strftime('%Y%m%d_%H%M%S')}_{epoch_number}.pt'
+        torch.save(model.module.state_dict(), model_path)
+        
+    dist.destroy_process_group()
+    return avg_loss
+
+main()
+
+
+#!torchrun --nproc_per_node=2 main.py
