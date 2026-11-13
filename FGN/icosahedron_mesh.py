@@ -136,37 +136,38 @@ def spherical_coordinates(vertices):
     y = vertices[:, 1]
     z = vertices[:, 2]
 
-    longitude = np.arctan2(y, x)
-    latitude = np.arcsin(z)
+    #radians
+    longitude_r = np.arctan2(y, x)
+    latitude_r = np.arcsin(z)
 
-    return latitude, longitude
+    return latitude_r, longitude_r
 
 def create_mesh_node_features(vertices):
 
-    latitude, longitude = spherical_coordinates(vertices)
+    latitude_r, longitude_r = spherical_coordinates(vertices)
 
     features = np.stack([
-        np.cos(latitude),
-        np.sin(longitude),
-        np.cos(longitude),
+        np.cos(latitude_r),
+        np.sin(longitude_r),
+        np.cos(longitude_r),
     ], axis=1)
 
     return features
 
 
 
-def receiver_rotation(latitude, longitude):
+def receiver_rotation(latitude_r, longitude_r):
     """
     Receiver-dependent local rotation: 
     - maps the receiver's position to (1, 0, 0).
     - Return R_y(latitude) R_z(-longitude).
     """
 
-    cl = np.cos(-longitude)
-    sl = np.sin(-longitude)
+    cl = np.cos(-longitude_r)
+    sl = np.sin(-longitude_r)
 
-    cp = np.cos(latitude)
-    sp = np.sin(latitude)
+    cp = np.cos(latitude_r)
+    sp = np.sin(latitude_r)
 
     Rz = np.array([
         [ cl, -sl, 0.0],
@@ -183,8 +184,8 @@ def receiver_rotation(latitude, longitude):
     return  Ry @ Rz
 
 def create_mesh_edges(vertices, faces):
-
-    latitude, longitude = spherical_coordinates(vertices)
+    #radians
+    latitude_r, longitude_r = spherical_coordinates(vertices)
 
     # Get unique undirected edges
     undirected_edges = set()
@@ -206,8 +207,8 @@ def create_mesh_edges(vertices, faces):
 
             # Receiver coordinate system
             R = receiver_rotation(
-                latitude[receiver],
-                longitude[receiver]
+                latitude_r[receiver],
+                longitude_r[receiver]
             )
 
             # Vector difference in receiver coordinates
@@ -318,14 +319,15 @@ def create_grid_to_mesh_edges(mesh_graph, site_idx,refinement):
     mesh_vertices = mesh_graph['mesh_nodes'].pos.numpy()
     #convert training sites to lat-lon
     grid_lat, grid_lon = site_index_to_lat_lon(site_idx)
-    grid_lat = grid_lat/180*np.pi
-    grid_lon = grid_lon/180*np.pi
+    #radians
+    grid_lat_r = grid_lat/180*np.pi
+    grid_lon_r = grid_lon/180*np.pi
     
     # Grid points -> Cartesian coordinates on unit sphere
     grid_xyz = np.column_stack([
-        np.cos(grid_lat) * np.cos(grid_lon),
-        np.cos(grid_lat) * np.sin(grid_lon),
-        np.sin(grid_lat)
+        np.cos(grid_lat_r) * np.cos(grid_lon_r),
+        np.cos(grid_lat_r) * np.sin(grid_lon_r),
+        np.sin(grid_lat_r)
     ])
 
     # Find grid-mesh pairs within threshold
@@ -352,7 +354,7 @@ def create_grid_to_mesh_edges(mesh_graph, site_idx,refinement):
     grid_to_mesh_edges = torch.column_stack((grid_idx_tensor,mesh_idx_tensor))
     
     G2M_attributes = []
-    latitude, longitude = spherical_coordinates(mesh_vertices)
+    latitude_r, longitude_r = spherical_coordinates(mesh_vertices)
     for edge in grid_to_mesh_edges:
         x_sender = grid_xyz[edge[0]]
         x_receiver = mesh_vertices[edge[1]]
@@ -360,8 +362,8 @@ def create_grid_to_mesh_edges(mesh_graph, site_idx,refinement):
         # Receiver coordinate system
         
         R = receiver_rotation(
-                    latitude[edge[1]],
-                    longitude[edge[1]]
+                    latitude_r[edge[1]],
+                    longitude_r[edge[1]]
                 )
         # Vector difference in receiver coordinates
         delta = R @ (x_sender - x_receiver)
@@ -376,8 +378,6 @@ def create_grid_to_mesh_edges(mesh_graph, site_idx,refinement):
                 ])
     G2M_attributes = np.asarray(G2M_attributes)
 
-    # max_length = np.max(G2M_attributes[:,0])
-    # G2M_attributes = G2M_attributes/max_length
     grid_to_mesh_edges = grid_to_mesh_edges.numpy().T
 
     return grid_to_mesh_edges, G2M_attributes, grid_features, grid_xyz
@@ -457,7 +457,9 @@ def create_M2G_attr(faces,grid2mesh_graph,site_idx,refinement):
     )
 
     grid_lat, grid_lon = site_index_to_lat_lon(site_idx)
-
+    grid_lat_r = grid_lat/180*np.pi
+    grid_lon_r = grid_lon/180*np.pi
+    
     M2G_attr = []
     for edge in M2G_edges_tensor:
         x_sender = grid2mesh_graph['mesh_nodes'].pos[edge[0]].numpy()
@@ -465,8 +467,8 @@ def create_M2G_attr(faces,grid2mesh_graph,site_idx,refinement):
         
         # Receiver coordinate system
         R = receiver_rotation(
-                    grid_lat[edge[1]],
-                    grid_lon[edge[1]]
+                    grid_lat_r[edge[1]],
+                    grid_lon_r[edge[1]]
                 )
         # Vector difference in receiver coordinates
         delta = R @ (x_sender - x_receiver)
@@ -480,9 +482,6 @@ def create_M2G_attr(faces,grid2mesh_graph,site_idx,refinement):
                     delta[2],
                 ])
     M2G_attr = np.asarray(M2G_attr)
-
-    # max_length = np.max(M2G_attr[:,0])
-    # M2G_attr = M2G_attr/max_length
 
     return M2G_edges.T, M2G_attr
 
@@ -519,12 +518,22 @@ test_idx = pd.read_csv(DATA_DIR / 'test.csv', header=None)[0].values
 COMP_DIR = Path('/kaggle/input/competitions/ieee-bigdata-cup-2026-ai-emulation-challenge/public')
 competition_test_idx  = pd.read_csv(COMP_DIR / 'sites_ssp.csv', header=None,skiprows=1)[0].values
 
-
-
+#build mesh graph
 mesh_graph, mesh_faces = create_mesh_graph(refinement=3)
+#add grid to mesh graph
 data = create_grid_to_mesh_graph(mesh_graph, test_idx[competition_test_idx],refinement=3)
-
+#add mesh to grid graph
 full_graph = create_mesh_to_grid_graph(mesh_faces,data,test_idx[competition_test_idx],refinement=3)
-full_graph
 
+#normalise by longest edge
+node_types, edge_types = full_graph.metadata()
+max_length =  0
+for edge in edge_types:
+    max_length_subgraph = torch.max(full_graph[edge].edge_attr)
+    if max_length_subgraph>max_length:
+        max_length = max_length_subgraph
+
+for edge in edge_types:
+    full_graph[edge].edge_attr = full_graph[edge].edge_attr/max_length
+    
 torch.save(full_graph,'full_graph.pt')
