@@ -1,10 +1,8 @@
 # AI Emulation Challenge: Global-Scale Land Ecosystem Forecasting
 
-A graph-based deep learning framework for global-scale forest and land ecosystem prediction, inspired by Google's WeatherNext 2 Functional Generative Networks (FGNs).
+A graph-based deep learning approach for global-scale forest and land ecosystem prediction, based on Google's WeatherNext2 Functional Generative Networks (FGNs) framework.
 
 ## Overview
-
-This repository contains a machine learning framework developed for the **IEEE BigData Cup 2026 – AI Emulation Challenge: Global-Scale Land Ecosystem Forecasting**.
 
 The project investigates the use of graph-based neural networks and spherical spatial representations to emulate complex land ecosystem dynamics and predict future forest and ecosystem states across geographically distributed sites.
 
@@ -20,13 +18,6 @@ To represent global spatial relationships, the model uses a spherical mesh const
 
 This provides a quasi-uniform discretisation of the Earth's surface, avoiding the spatial distortions associated with conventional latitude–longitude representations.
 
-The mesh is used to construct a graph in which:
-- Nodes represent spatial locations on the sphere.
-- Edges connect neighbouring mesh nodes.
-- Node attributes encode geographical information.
-- Edge attributes capture spatial relationships, including edge lengths and relative positional information.
-
-This representation allows the model to learn spatial dependencies across the globe.
 
 ### 2. Graph-based neural network architecture
 
@@ -88,15 +79,8 @@ The main components of the architecture are:
 
 ## Dataset and evaluation
 
-The project addresses the IEEE BigData Cup 2026 AI Emulation Challenge:
+The project addresses the IEEE BigData Cup 2026 AI Emulation Challenge: **Global-Scale Land Ecosystem Forecasting**
 
-**Global-Scale Land Ecosystem Forecasting**
-
-The challenge involves predicting ecosystem variables at geographically distributed sites around the world.
-
-The test set contains 6,171 sites.
-
-The model is designed to exploit spatial information from the training data and generalise to unseen geographical locations.
 
 Evaluation is performed using the challenge-provided training and validation data, with predictions generated in the required test-site ordering and format.
 
@@ -114,9 +98,7 @@ The implementation uses:
 
 ## Acknowledgements
 
-This project was developed for the **IEEE BigData Cup 2026 AI Emulation Challenge**.
-
-The work is inspired by Google's WeatherNext 2 and its Functional Generative Network approach to environmental forecasting.
+The work is inspired by Google's WeatherNext 2 and its Functional Generative Network approach to medium-range weather forecasting.
 
 **References**
 
